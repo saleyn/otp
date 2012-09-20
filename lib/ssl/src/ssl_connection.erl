@@ -34,6 +34,8 @@
 -include("ssl_record.hrl").
 -include("ssl_cipher.hrl"). 
 -include("ssl_internal.hrl").
+-include("../include/ssl_srp.hrl").
+-include("../include/ssl_srp_primes.hrl").
 -include_lib("public_key/include/public_key.hrl"). 
 
 %% Internal application API
@@ -83,6 +85,8 @@
 	  diffie_hellman_params, % PKIX: #'DHParameter'{} relevant for server side
 	  diffie_hellman_keys, % {PublicKey, PrivateKey}
 	  psk_identity,        % binary() - server psk identity hint
+	  srp_params,          % #srp_user{}
+	  srp_keys,            % {PublicKey, PrivateKey}
           premaster_secret,    %
 	  file_ref_db,         % ets()
           cert_db_ref,         % ref()
@@ -543,7 +547,8 @@ certify(#server_key_exchange{} = KeyExchangeMsg,
         #state{role = client, negotiated_version = Version,
 	       key_algorithm = Alg} = State0) 
   when Alg == dhe_dss; Alg == dhe_rsa;  Alg == dh_anon;
-       Alg == psk; Alg == dhe_psk; Alg == rsa_psk ->
+       Alg == psk; Alg == dhe_psk; Alg == rsa_psk;
+       Alg == srp_dss; Alg == srp_rsa; Alg == srp_anon ->
     case handle_server_key(KeyExchangeMsg, State0) of
 	#state{} = State1 ->
 	    {Record, State} = next_record(State1),
@@ -729,6 +734,21 @@ certify_client_key_exchange(#client_rsa_psk_identity{
 				   private_key = Key} = State0) ->
     PremasterSecret = ssl_handshake:decrypt_premaster_secret(EncPMS, Key),
     case server_rsa_psk_master_secret(PskIdentity, PremasterSecret, State0) of
+	#state{} = State1 ->
+	    {Record, State} = next_record(State1),
+	    next_state(certify, cipher, Record, State);
+	#alert{} = Alert ->
+	    handle_own_alert(Alert, Version, certify, State0),
+	    {stop, normal, State0}
+    end;
+
+certify_client_key_exchange(#client_srp_public{srp_a = ClientPublicKey},
+			    #state{negotiated_version = Version,
+				   srp_params =
+				       #srp_user{prime = Prime,
+						 verifier = Verifier}
+				  } = State0) ->
+    case server_srp_master_secret(Verifier, Prime, ClientPublicKey, State0) of
 	#state{} = State1 ->
 	    {Record, State} = next_record(State1),
 	    next_state(certify, cipher, Record, State);
@@ -1679,6 +1699,44 @@ key_exchange(#state{role = server, key_algorithm = rsa_psk,
     State#state{connection_states = ConnectionStates,
                 tls_handshake_history = Handshake};
 
+key_exchange(#state{role = server, key_algorithm = Algo,
+		    ssl_options = #ssl_options{user_lookup_fun = LookupFun},
+		    hashsign_algorithm = HashSignAlgo,
+		    session = #session{srp_username = Username},
+		    private_key = PrivateKey,
+		    connection_states = ConnectionStates0,
+		    negotiated_version = Version,
+		    tls_handshake_history = Handshake0,
+		    socket = Socket,
+		    transport_cb = Transport
+		   } = State)
+  when Algo == srp_dss;
+       Algo == srp_rsa;
+       Algo == srp_anon ->
+    SrpParams = srp_user_lookup(Username, LookupFun),
+    Keys = case generate_srp_server_keys(SrpParams, 0) of
+	       Alert = #alert{} ->
+		   throw(Alert);
+	       Keys0 = {_,_} ->
+		   Keys0
+	   end,
+    ConnectionState =
+	ssl_record:pending_connection_state(ConnectionStates0, read),
+    SecParams = ConnectionState#connection_state.security_parameters,
+    #security_parameters{client_random = ClientRandom,
+			 server_random = ServerRandom} = SecParams,
+    Msg =  ssl_handshake:key_exchange(server, Version, {srp, Keys, SrpParams,
+					       HashSignAlgo, ClientRandom,
+					       ServerRandom,
+					       PrivateKey}),
+    {BinMsg, ConnectionStates, Handshake} =
+        encode_handshake(Msg, Version, ConnectionStates0, Handshake0),
+    Transport:send(Socket, BinMsg),
+    State#state{connection_states = ConnectionStates,
+		srp_params = SrpParams,
+		srp_keys = Keys,
+                tls_handshake_history = Handshake};
+
 key_exchange(#state{role = client, 
 		    connection_states = ConnectionStates0,
 		    key_algorithm = rsa,
@@ -1749,6 +1807,23 @@ key_exchange(#state{role = client,
 		    socket = Socket, transport_cb = Transport,
 		    tls_handshake_history = Handshake0} = State) ->
     Msg = rsa_psk_key_exchange(Version, SslOpts#ssl_options.psk_identity, PremasterSecret, PublicKeyInfo),
+    {BinMsg, ConnectionStates, Handshake} =
+        encode_handshake(Msg, Version, ConnectionStates0, Handshake0),
+    Transport:send(Socket, BinMsg),
+    State#state{connection_states = ConnectionStates,
+                tls_handshake_history = Handshake};
+
+key_exchange(#state{role = client,
+		    connection_states = ConnectionStates0,
+		    key_algorithm = Algorithm,
+		    negotiated_version = Version,
+		    srp_keys = {ClntPubKey, _},
+		    socket = Socket, transport_cb = Transport,
+		    tls_handshake_history = Handshake0} = State)
+  when Algorithm == srp_dss;
+       Algorithm == srp_rsa;
+       Algorithm == srp_anon ->
+    Msg =  ssl_handshake:key_exchange(client, Version, {srp, ClntPubKey}),
     {BinMsg, ConnectionStates, Handshake} =
         encode_handshake(Msg, Version, ConnectionStates0, Handshake0),
     Transport:send(Socket, BinMsg),
@@ -1917,7 +1992,11 @@ server_master_secret(#server_dhe_psk_params{
 			hint = IdentityHint,
 			dh_params = #server_dh_params{dh_p = P, dh_g = G, dh_y = ServerPublicDhKey}},
 		     State) ->
-    dhe_psk_master_secret(IdentityHint, P, G, ServerPublicDhKey, undefined, State).
+    dhe_psk_master_secret(IdentityHint, P, G, ServerPublicDhKey, undefined, State);
+
+server_master_secret(#server_srp_params{srp_n = N, srp_g = G, srp_s = S, srp_b = B},
+		     State) ->
+    client_srp_master_secret(N, G, S, B, undefined, State).
 
 master_from_premaster_secret(PremasterSecret,
 			     #state{session = Session,
@@ -2003,6 +2082,81 @@ server_rsa_psk_master_secret(PskIdentity, PremasterSecret,
 	_ ->
 	    ?ALERT_REC(?FATAL, ?ILLEGAL_PARAMETER)
     end.
+
+generate_srp_server_keys(_SrpParams, 10) ->
+    ?ALERT_REC(?FATAL, ?ILLEGAL_PARAMETER);
+generate_srp_server_keys(SrpParams =
+			     #srp_user{prime = Prime, generator = Generator,
+				       verifier = Verifier}, N) ->
+    Private = ssl:random_bytes(32),
+    case crypto:srp_tls_server_pubkey(Private, Prime, Generator, Verifier) of
+	error ->
+	    generate_srp_server_keys(SrpParams, N+1);
+	Public -> {Public, Private}
+    end.
+
+generate_srp_client_keys(_Prime, _Generator, 10) ->
+    ?ALERT_REC(?FATAL, ?ILLEGAL_PARAMETER);
+generate_srp_client_keys(Prime, Generator, N) ->
+    Private = ssl:random_bytes(32),
+    case crypto:srp_tls_client_pubkey(Private, Prime, Generator) of
+	error ->
+	    generate_srp_client_keys(Prime, Generator, N+1);
+	Public -> {Public, Private}
+    end.
+
+srp_user_lookup(Username, {Fun, UserState}) ->
+    case Fun(srp, Username, UserState) of
+	{ok, UserInfo} when is_record(UserInfo, srp_user) ->
+	    UserInfo;
+	#alert{} = Alert ->
+	    throw(Alert);
+	_ ->
+	    throw(?ALERT_REC(?FATAL, ?ILLEGAL_PARAMETER))
+    end.
+
+server_srp_master_secret(Verifier, Prime, ClntPub, State = #state{srp_keys = {SrvrPub, SrvrPriv}}) ->
+    case crypto:srp_tls_server_premaster(Verifier, SrvrPriv, SrvrPub, ClntPub, Prime) of
+	error ->
+	    ?ALERT_REC(?FATAL, ?ILLEGAL_PARAMETER);
+	PremasterSecret ->
+	    master_from_premaster_secret(PremasterSecret, State)
+    end.
+
+client_srp_master_secret(_Prime, _Generator, _Salt, _SrvrPub, #alert{} = Alert, _State) ->
+    Alert;
+client_srp_master_secret(Prime, Generator, Salt, SrvrPub, undefined, State) ->
+    Keys = generate_srp_client_keys(Prime, Generator, 0),
+    client_srp_master_secret(Prime, Generator, Salt, SrvrPub, Keys, State#state{srp_keys = Keys});
+
+client_srp_master_secret(Prime, Generator, Salt, SrvrPub, {ClntPub, ClntPriv},
+		 #state{ssl_options = SslOpts} = State) ->
+    case check_srp_server_params(Prime, Generator) of
+	ok ->
+	    {Username, Password} = SslOpts#ssl_options.srp_identity,
+	    UserPassHash = crypto:sha([Salt, crypto:sha([Username, <<$:>>, Password])]),
+
+	    case crypto:srp_tls_client_premaster(UserPassHash, ClntPriv, ClntPub,
+						 SrvrPub, Prime, Generator) of
+		error ->
+		    ?ALERT_REC(?FATAL, ?ILLEGAL_PARAMETER);
+		PremasterSecret ->
+
+		    master_from_premaster_secret(PremasterSecret, State)
+	    end;
+	_ ->
+	    ?ALERT_REC(?FATAL, ?ILLEGAL_PARAMETER)
+    end.
+
+check_srp_server_params(?PRIME_1024, ?GENERATOR_1024) -> ok;
+check_srp_server_params(?PRIME_1536, ?GENERATOR_1536) -> ok;
+check_srp_server_params(?PRIME_2048, ?GENERATOR_2048) -> ok;
+check_srp_server_params(?PRIME_3072, ?GENERATOR_3072) -> ok;
+check_srp_server_params(?PRIME_4096, ?GENERATOR_4096) -> ok;
+check_srp_server_params(?PRIME_6144, ?GENERATOR_6144) -> ok;
+check_srp_server_params(?PRIME_8192, ?GENERATOR_8192) -> ok;
+check_srp_server_params(_Prime, _Generator) ->
+    not_accepted.
 
 cipher_role(client, Data, Session, #state{connection_states = ConnectionStates0} = State) -> 
     ConnectionStates = ssl_record:set_server_verify_data(current_both, Data, ConnectionStates0),
@@ -2794,20 +2948,24 @@ default_hashsign(_Version = {Major, Minor}, KeyExchange)
   when Major == 3 andalso Minor >= 3 andalso
        (KeyExchange == rsa orelse
 	KeyExchange == dhe_rsa orelse
-	KeyExchange == dh_rsa) ->
+	KeyExchange == dh_rsa orelse
+	KeyExchange == srp_rsa) ->
     {sha, rsa};
 default_hashsign(_Version, KeyExchange)
   when KeyExchange == rsa;
        KeyExchange == dhe_rsa;
-       KeyExchange == dh_rsa ->
+       KeyExchange == dh_rsa;
+       KeyExchange == srp_rsa ->
     {md5sha, rsa};
 default_hashsign(_Version, KeyExchange)
   when KeyExchange == dhe_dss;
-       KeyExchange == dh_dss ->
+       KeyExchange == dh_dss;
+       KeyExchange == srp_dss ->
     {sha, dsa};
 default_hashsign(_Version, KeyExchange)
   when KeyExchange == dh_anon;
        KeyExchange == psk;
        KeyExchange == dhe_psk;
-       KeyExchange == rsa_psk ->
+       KeyExchange == rsa_psk;
+       KeyExchange == srp_anon ->
     {null, anon}.
