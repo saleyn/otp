@@ -2272,14 +2272,28 @@ static ERL_NIF_TERM dh_compute_key_nif(ErlNifEnv* env, int argc, const ERL_NIF_T
 
 /*
  * SHA1_Update(PAD(g))
+ *
+ * from RFC-5054:
+ *    If a conversion is explicitly specified with the
+ *    operator PAD(), the integer will first be implicitly converted, then
+ *    the resultant byte-string will be left-padded with zeros (if
+ *    necessary) until its length equals the implicitly-converted length of
+ *    N (the prime).
  */
+#define SHA_BLOCK_SIZE 64
 static void SHA1_Update_PAD(SHA_CTX *c, const void *data,
 			    unsigned long len, unsigned long pad)
 {
+    int cnt;
+    char zero[SHA_BLOCK_SIZE];
+
     if (pad) {
-	char zero[pad];
-	memset(&zero, 0, pad);
-	SHA1_Update(c, &zero, pad);
+	memset(&zero, 0, SHA_BLOCK_SIZE);
+	while (pad > 0) {
+	    cnt = SHA_BLOCK_SIZE < pad ? SHA_BLOCK_SIZE : pad;
+	    SHA1_Update(c, &zero, cnt);
+	    pad -= cnt;
+	}
     }
     SHA1_Update(c, data, len);
 }
