@@ -214,7 +214,7 @@ sys_double_to_chars_fast(double f, char *buffer, int buffer_size, int decimals, 
     mantissa |= (1ll << FRAC_SIZE);
 
     /* Don't bother with optimizing too large numbers or too large precision */
-    if (x.F > MAX_FLOAT || decimals >= MAX_DECIMALS) {
+    if (x.F > MAX_FLOAT || decimals > FRAC_SIZE) {
         int len = erts_snprintf(buffer, buffer_size, "%.*f", decimals, f);
         char* p = buffer + len;
         if (len >= buffer_size)
