@@ -452,6 +452,40 @@ By default EPMD listens on port 4369.
 	    <cell align="center">NodeInfo*</cell>
 	  </row>
 	<tcaption>NAMES_RESP</tcaption></table>
+
+	<p>The response for a <c>NAMES3_REQ</c> looks like this:</p>
+	<table align="left">
+	  <row>
+	    <cell align="center">1</cell>
+	    <cell align="center">4</cell>
+	    <cell align="center">&nbsp;</cell>
+	  </row>
+	  <row>
+	    <cell align="center">MoreData</cell>
+	    <cell align="center">EPMDPortNo</cell>
+	    <cell align="center">NodeInfo*</cell>
+	  </row>
+	<tcaption>NAMES3_RESP: first part</tcaption></table>
+
+        <p>If the response message doesn't fit in the response buffer of epmd,
+          it may be fragmented, with subsequent blocks having the following
+          format (prepended by the 2-byte message size):</p>
+	<table align="left">
+	  <row>
+	    <cell align="center">1</cell>
+	    <cell align="center">&nbsp;</cell>
+	  </row>
+	  <row>
+	    <cell align="center">MoreData</cell>
+	    <cell align="center">NodeInfo*</cell>
+	  </row>
+	<tcaption>NAMES3_RESP: next part</tcaption></table>
+
+        <p>
+          MoreData is an indicator 0 or 1. if this is the last block containing
+          response content, its value is 0. If there are more blocks coming from
+          the epmd server in reply to NAMES3_REQ, its value is 1.
+        </p>
 	<p>
 	  NodeInfo is a string written for each active node.
 	  When all NodeInfo has been written the connection is
@@ -510,6 +544,40 @@ By default EPMD listens on port 4369.
 	    <cell align="center">NodeInfo*</cell>
 	  </row>
 	<tcaption>DUMP_RESP</tcaption></table>
+
+	<p>The response for a <c>DUMP3_REQ</c> looks like this:</p>
+	<table align="left">
+	  <row>
+	    <cell align="center">1</cell>
+	    <cell align="center">4</cell>
+	    <cell align="center">&nbsp;</cell>
+	  </row>
+	  <row>
+	    <cell align="center">MoreData</cell>
+	    <cell align="center">EPMDPortNo</cell>
+	    <cell align="center">NodeInfo*</cell>
+	  </row>
+	<tcaption>DUMP3_RESP: first part</tcaption></table>
+
+        <p>If the response message doesn't fit in the response buffer of epmd,
+          it may be fragmented, with subsequent blocks having the following
+          format (prepended by the 2-byte message size):</p>
+	<table align="left">
+	  <row>
+	    <cell align="center">1</cell>
+	    <cell align="center">&nbsp;</cell>
+	  </row>
+	  <row>
+	    <cell align="center">MoreData</cell>
+	    <cell align="center">NodeInfo*</cell>
+	  </row>
+	<tcaption>DUMP3_RESP: next part</tcaption></table>
+
+        <p>
+          MoreData is an indicator 0 or 1. if this is the last block containing
+          response content, its value is 0. If there are more blocks coming from
+          the epmd server in reply to NAMES3_REQ, its value is 1.
+        </p>
 	<p>
 	  NodeInfo is a string written for each node kept in EPMD.
 	  When all NodeInfo has been written the connection is

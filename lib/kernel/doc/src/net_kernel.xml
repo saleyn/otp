@@ -67,13 +67,14 @@
       distributed Erlang node queries its <c>epmd</c> daemon giving it
       a list of transports it supports, and gets back a list of ports
       with matching transports. A user-level function can be given to
-      <c>net_kernel</c> via
+      <c>net_kernel</c> via <c>-proto_dist_mf</c> command-line option:</p>
 <pre>$ <input>erl -sname foobar -proto_dist_mf module function ...</input></pre>
-      The <c>-proto_dist_mf module function</c> instruct <c>net_kernel</c>
+    <p>The <c>-proto_dist_mf module function</c> instruct <c>net_kernel</c>
       to use the <c>module:function/4</c> for handling connection
-      transport selection.  That function has the following signature:
-<pre>(LocalProtoMods::[Mod::atom()], PeerNode::atom(),
-      PeerIp::tuple(), PeerPortMods::[{Port::integer(), Mod::atom()}]) ->
+      transport selection.  That function has the following signature:</p>
+
+<pre>    (LocalProtoMods::[Mod::atom()], PeerNode::atom(),
+     PeerIp::tuple(), PeerPortMods::[{Port::integer(), Mod::atom()}]) ->
         {ok, {Port::integer(), Mod::atom()}} | false.
 
     The parameters are:
@@ -89,9 +90,9 @@
         PeerPortMods   - List of {Port, Mod} pairs on the peer node, where
                          Port is the port number that Mod transport is
                          listening on.</pre>
-      A sample implementation of two such custom functions
+    <p>A sample implementation of two such custom functions
       <c>dist_selector:select_first/4</c> and <c>dist_selector:select/4</c>
-      can be found in <c>lib/kernel/examples/uds_dist/src/dist_selector.erl.
+      can be found in <c>lib/kernel/examples/uds_dist/src/dist_selector.erl.</c>
     </p>
   </description>
   <funcs>

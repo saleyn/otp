@@ -176,25 +176,27 @@ fill_portprotos_return:
     return dest - start;
 }
 
-static int copy_str(char *x, const char *y)
+static int copy_str(char *x, const char *y, const char *end)
 {
-    int i = 0;
+    char *p;
+    const char *q;
     /*
      * Using strcpy() is probably ok, but just to be sure,
      * since we got UTF-8 strings, we do it ourselves.
      *
      * We assume null-terminated correctly encoded UTF-8.
      */
-    while (1) {
-	x[i] = y[i];
-	if (y[i] == '\0')
-	    return i;
-	i++;
+    for (p = x, q = y; p < end; ++p, ++q) {
+	*p = *q;
+	if (*q == '\0')
+	    break;
     }
+
+    return p - x;
 }
 
 static int dump_ports(struct enode *node, char *wbuf, const char *wend,
-    const char *prefix, const char *suffix, int new_fmt,
+    const char *prefix, const char *suffix, int fmt_ver,
     int include_fd, const char *eol)
 {
     int r, i;
@@ -206,27 +208,34 @@ static int dump_ports(struct enode *node, char *wbuf, const char *wend,
     /* CAREFUL!!! These are parsed by "erl_epmd.erl" so a slight
        change in syntax will break < OTP R3A */
 
-    p += copy_str(p, prefix);
-    p += copy_str(p, node->symname);
-    r = erts_snprintf(p, wend-p, "%s at port", suffix);
-    if (r < 0) return r;
+    p += copy_str(p, prefix, wend);
+    p += copy_str(p, node->symname, wend);
+    /* Note that we first copy to a buffer using snprintf() and then to
+     * the resulting buffer using byte-copy, so that we can fill the
+     * resulting buffer all the way to the end - this is needed so that
+     * we can process large dumps that exceed size of wbuf (16k) */
+    r = erts_snprintf(p, wbuf - p, "%s at port", suffix);
+    if (r < 0) return -1;
     p += r;
 
-    if (new_fmt) {
+    if (fmt_ver > 0) {
         for (i = 0; i < node->portprotolen; i++, p += r)
-            if ((r = erts_snprintf(p, wend-p,
+            if ((r = erts_snprintf(p, wbuf - p,
                         " %hu#%s", node->portproto[i].port,
                         node->portproto[i].proto_name)) < 0)
-                return r;
+                return -1;
     } else {
-        r = erts_snprintf(p, wend-p, " %hu", node->portproto[0].port);
-        if (r < 0) return r;
+        r = erts_snprintf(p, wbuf-p, " %hu", node->portproto[0].port);
+        if (r < 0)
+            return -1;
         p += r;
     }
+
     r = include_fd
-      ? erts_snprintf(p, wend-p, ", fd = %d%s", node->fd, eol)
-      : erts_snprintf(p, wend-p, "%s", eol);
-    return r < 0 ? r : (p + r) - wbuf;
+      ? erts_snprintf(p, wbuf - p, ", fd = %d%s", node->fd, eol)
+      : erts_snprintf(p, wbuf - p, "%s", eol);
+
+    return r < 0 ? -1 : p+r - wbuf;
 }
 
 static int length_str(char *x)
@@ -695,7 +704,7 @@ static void do_request(g, fd, s, buf, bsize)
      char *buf;
      int bsize;
 {
-  char wbuf[16384];	/* Buffer for writing */
+  char wbuf[16*1024];    /* Buffer for writing */
   char *wbegin = wbuf+2; /* 2-bytes for the reply length */
   const char *wend = wbuf+sizeof(wbuf);
   int i;
@@ -830,7 +839,7 @@ static void do_request(g, fd, s, buf, bsize)
 
       dbg_printf(g,1,"** got %s (size=%d)", cmd, size);
 	
-      if (ver < 3 && size < 1 || ver >= 3 && size < 6)
+      if ((ver < 3 && size < 1) || (ver >= 3 && size < 6))
 	{
 	  dbg_printf(g,0,"packet too small for request %s", cmd);
 	  return;
@@ -909,7 +918,7 @@ static void do_request(g, fd, s, buf, bsize)
                 put_int16(node->highvsn, p); p += 2;
                 put_int16(node->lowvsn,  p); p += 2;
                 put_int16(length_str(node->symname), p); p += 2;
-                p += copy_str(p, node->symname);
+                p += copy_str(p, node->symname, wend);
                 put_int16(node->extralen, p); p += 2;
                 memcpy(p, node->extra, node->extralen); p += node->extralen;
                 wend = p;
@@ -954,36 +963,46 @@ static void do_request(g, fd, s, buf, bsize)
     {
       const int   ver = *buf == EPMD_NAMES3_REQ ? 3 : 0;
       const char *cmd = ver >= 3 ? "NAMES3_REQ" : "NAMES_REQ";
-      char         *p = wbegin;
-      Node *node;
+      char         *p = ++wbegin; /* Reserve 1 byte for more_data indicator */
+      int   more_data = 0;
+      Node      *node = g->nodes.reg;
 
       dbg_printf(g,1,"** got %s", cmd);
 
       put_int32(g->port, p); p += 4;
 
-      for (node = g->nodes.reg; node; node = node->next, p += i)
-      {
-          /* CAREFUL!!! These are parsed by "erl_epmd.erl" so a slight
-             change in syntax will break < OTP R3A */
+      /* Loop until all data is sent */
+      while (1)
+        {
+          for (; node; node = node->next, p += i)
+            {
+              /* CAREFUL!!! These are parsed by "erl_epmd.erl" so a slight
+                 change in syntax will break < OTP R3A */
 
-          i = dump_ports(node, p, wend, "name ", "", ver, 0, "\n");
-          if (i < 0)
-          {
+              i = dump_ports(node, p, wend, "name ", "", ver, 0, "\n");
+              if (i < 0) {
+                more_data = 1;
+                break;
+              }
+            }
+
+          i = p - (wbegin - 1);
+          put_int16(i, wbuf);
+          *(wbegin-1) = more_data;
+          if (ver >= 3) wbegin = wbuf;
+          i = p - wbegin;
+
+          if (reply(g, fd, wbegin, i) != i)
+            {
               dbg_tty_printf(g,1,"failed to send NAMES_RESP");
               return;
-          }
-      }
+            }
+          else if (!more_data)
+            break;
 
-      i = p - wbegin;
-      put_int16(i, wbuf);
-      if (ver >= 3) wbegin = wbuf;
-      i = p - wbegin;
-
-      if (reply(g, fd, wbegin, i) != i)
-      {
-          dbg_tty_printf(g,1,"failed to send NAMES_RESP");
-          return;
-      }
+          p = wbegin = wbuf + 3;
+          more_data = 0;
+        }
       dbg_tty_printf(g,1,"** sent NAMES_RESP");
       break;
     }
@@ -993,10 +1012,12 @@ static void do_request(g, fd, s, buf, bsize)
     {
       const int   ver = *buf == EPMD_DUMP3_REQ ? 3 : 0;
       const char *cmd = ver > 0 ? "DUMP3_REQ" : "DUMP_REQ";
-      char *p = wbegin;
-      Node *node;
+      char         *p = ++wbegin; /* Reserve 1 byte for more_data incicator */
+      int   more_data = 0;
+      Node *rnode = g->nodes.reg, *unode = g->nodes.unreg;
 
       dbg_printf(g,1,"** got %s", cmd);
+
       if (!s->local_peer) {
 	   dbg_printf(g,0,"%s from non local address", cmd);
 	   return;
@@ -1004,36 +1025,45 @@ static void do_request(g, fd, s, buf, bsize)
 
       put_int32(g->port, p); p += 4;
 
-      for (node = g->nodes.reg; node; node = node->next, p += i)
+      while (1)
         {
-            i = dump_ports(node, p, wend,
-                    "active name     <", ">", ver, 1, "\n");
-            if (i < 0)
-                goto failed_dump_resp;
+          for (; rnode; rnode = rnode->next, p += i)
+            {
+              i = dump_ports(rnode, p, wend,
+                      "active name     <", ">", ver, 1, "\n");
+              if (i < 0) {
+                  more_data = 1;
+                  break;
+              }
+            }
+
+          for (; unode; unode = unode->next, p += i)
+            {
+              i = dump_ports(unode, p, wend,
+                      "old/unused name <", ">", ver, 1, "\n");
+              if (i < 0) {
+                  more_data = 1;
+                  break;
+              }
+            }
+
+          i = p - (wbegin - 1);
+          put_int16(i, wbuf);
+          *(wbegin-1) = more_data;
+          if (ver >= 3) wbegin = wbuf;
+          i = p - wbegin;
+
+          if (reply(g, fd, wbegin, i) != i) {
+              dbg_tty_printf(g,1,"failed to send DUMP_RESP");
+              return;
+          } else if (!more_data)
+              break;
+
+          p = wbegin = wbuf + 3;
+          more_data = 0;
         }
-
-      for (node = g->nodes.unreg; node; node = node->next, p += i)
-        {
-            i = dump_ports(node, p, wend,
-                    "old/unused name <", ">", ver, 1, "\n");
-            if (i < 0)
-                goto failed_dump_resp;
-        }
-
-      i = p - wbegin;
-      put_int16(i, wbuf);
-      if (ver >= 3) wbegin = wbuf;
-      i = p - wbegin;
-
-      if (reply(g, fd, wbegin, i) != i)
-          goto failed_dump_resp;
-
       dbg_tty_printf(g,1,"** sent DUMP_RESP");
       break;
-
-    failed_dump_resp:
-      dbg_tty_printf(g,1,"failed to send DUMP_RESP");
-      return;
     }
 
     case EPMD_KILL3_REQ:
@@ -1057,9 +1087,9 @@ static void do_request(g, fd, s, buf, bsize)
 
       if (!g->brutal_kill && (g->nodes.reg != NULL)) {
 	  dbg_printf(g,0,"Disallowed %s, live nodes", cmd);
-          strncpy(p, "NO", 2); p += 2;
+          p += copy_str(p, "NO", wend);
       } else {
-          strncpy(p, "OK", 2); p += 2;
+          p += copy_str(p, "OK", wend);
           stop = 1;
       }
 
@@ -1109,7 +1139,7 @@ static void do_request(g, fd, s, buf, bsize)
 
 	if ((node_fd = node_unreg(g,name)) < 0)
 	  {
-            strncpy(p, "NOEXIST", 7); p += 7;
+            p += copy_str(p, "NOEXIST", wend);
             i = p - wbegin;
             put_int16(i, wbuf);
             if (ver > 0) wbegin = wbuf;
@@ -1127,7 +1157,7 @@ static void do_request(g, fd, s, buf, bsize)
 	    conn_close_fd(g,node_fd);
 	    dbg_tty_printf(g,1,"epmd connection stopped");
 
-            strncpy(p, "STOPPED", 7); p += 7;
+            p += copy_str(p, "STOPPED", wend);
             i = p - wbegin;
             put_int16(i, wbuf);
             if (ver > 0) wbegin = wbuf;
@@ -1566,7 +1596,7 @@ add_node_proto:
   node->extralen = extralen;
   memcpy(node->extra,extra,extralen);
   node->symnamelen = namelen;
-  copy_str(node->symname,name);
+  copy_str(node->symname,name, node->symname+sizeof(node->symname));
   select_fd_set(g, fd);
 
   dbg_tty_printf(g,1,"registering '%s:%d', port %d protoname '%s'",
@@ -1618,9 +1648,11 @@ static int reply(EpmdVars *g,int fd,char *buf,int len)
 
 #define LINEBYTECOUNT 16
 
-static void print_buf_hex(unsigned char *buf,int len,char *prefix)
+static void print_buf_hex(unsigned char *buf,int offset,int len,char *prefix)
 {
   int rows, row;
+
+  buf += offset;
 
   rows = len / LINEBYTECOUNT; /* Number of rows */
   if (len % LINEBYTECOUNT)
@@ -1632,7 +1664,7 @@ static void print_buf_hex(unsigned char *buf,int len,char *prefix)
       int rowend   = rowstart + LINEBYTECOUNT;
       int i;
 
-      fprintf(stderr,"%s%.8x",prefix,rowstart);
+      fprintf(stderr,"%s%.8x",prefix,offset + rowstart);
 
       for (i = rowstart; i < rowend; i++)
 	{
@@ -1675,10 +1707,14 @@ static void dbg_print_buf(EpmdVars *g,char *buf,int len)
 
   plen = len > 1024 ? 1024 : len; /* Limit the number of chars to print */
 
-  print_buf_hex((unsigned char*)buf,plen,"***** ");
+  print_buf_hex((unsigned char*)buf,0,plen,"***** ");
 
-  if (len != plen)
-    fprintf(stderr,"***** ......and more\r\n");
+  if (len != plen) {
+    int n = (len - plen) > 160 ? 160 : (len - plen);
+    int offset = len - n;
+    fprintf(stderr,"***** ......and more, last %d bytes follow:\r\n", n);
+    print_buf_hex((unsigned char*)buf,offset,n,"***** ");
+  }
 }
 
 static void print_names(EpmdVars *g)

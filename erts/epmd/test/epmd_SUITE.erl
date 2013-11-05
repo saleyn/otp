@@ -42,6 +42,7 @@
 -export(
    [
     register_name/1,
+    register_name_v3/1,
     register_names_1/1,
     register_names_2/1,
     register_duplicate_name/1,
@@ -55,6 +56,7 @@
     name_with_null_inside/1,
     name_null_terminated/1,
     stupid_names_req/1,
+    names3_req/1,
 
     no_data/1,
     one_byte/1,
@@ -92,14 +94,22 @@
 -define(REG_REPEAT_LIM,1000).
 
 % Message codes in epmd protocol
--define(EPMD_ALIVE2_REQ,	$x).
--define(EPMD_ALIVE2_RESP,	$y).
--define(EPMD_PORT_PLEASE2_REQ,	$z).
--define(EPMD_PORT2_RESP,	$w).
--define(EPMD_NAMES_REQ,	$n).
--define(EPMD_DUMP_REQ,	$d).
--define(EPMD_KILL_REQ,	$k).
--define(EPMD_STOP_REQ,	$s).
+-define(EPMD_ALIVE2_REQ, $x).
+-define(EPMD_ALIVE3_REQ, $X).
+-define(EPMD_PORT2_REQ,  $z).
+-define(EPMD_PORT3_REQ,  $Z).
+-define(EPMD_ALIVE2_RESP,$y).
+-define(EPMD_PORT2_RESP, $w).
+-define(EPMD_NAMES2,     $n).
+-define(EPMD_NAMES3,     $N).
+
+%% Commands used only by interactive client
+-define(EPMD_DUMP, $d).
+-define(EPMD_DUMP3,$D).
+-define(EPMD_KILL, $k).
+-define(EPMD_KILL3,$K).
+-define(EPMD_STOP, $s).
+-define(EPMD_STOP3,$S).
 
 %%
 %% all/1
@@ -109,6 +119,7 @@ suite() -> [{ct_hooks,[ts_install_cth]}].
 
 all() -> 
     [register_name, register_names_1, register_names_2,
+     register_name_v3, names3_req,
      register_duplicate_name, unicode_name, long_unicode_name,
      get_port_nr, slow_get_port_nr,
      unregister_others_name_1, unregister_others_name_2,
@@ -162,6 +173,16 @@ register_name(suite) ->
 register_name(Config) when is_list(Config) ->
     ?line ok = epmdrun(),
     ?line {ok,Sock} = register_node("foobar"),
+    ?line ok = close(Sock),			% Unregister
+    ok.
+
+register_name_v3(doc) ->
+    ["Register a name epmd v3"];
+register_name_v3(suite) ->
+    [];
+register_name_v3(Config) when is_list(Config) ->
+    ?line ok = epmdrun(),
+    ?line {ok,Sock} = register_node_v3("foobar", 12345, <<"abc">>),
     ?line ok = close(Sock),			% Unregister
     ok.
 
@@ -258,10 +279,35 @@ register_node_v2(Port, NodeType, Prot, HVsn, LVsn, Name, Extra) ->
 	    error
     end.
 
+register_node_v3(Name, Port, Extra) ->
+    register_node_v3(Port, $M, "inet_tcp", 5, 5, Name, Extra).
+register_node_v3(Port, NodeType, Proto, HVsn, LVsn, Name, Extra) ->
+    Utf8Name = unicode:characters_to_binary(Name),
+    Packet = <<?EPMD_ALIVE3_REQ, Port:16/integer, NodeType,
+               (length(Proto)), (list_to_binary(Proto))/binary,
+               (HVsn):16/integer,
+               (LVsn):16/integer,
+               (byte_size(Utf8Name)):16/integer, Utf8Name/binary,
+               (byte_size(Extra)):16/integer, Extra/binary>>,
+    case connect_opt([{packet, 2}, binary]) of
+    {ok, S} ->
+        ?line ok = send_direct(S, Packet),
+        receive
+        {tcp, S, <<?EPMD_ALIVE2_RESP, 0, _Creation:16/integer>>} ->
+            {ok, S};
+        Err ->
+            {error, Err}
+        after 10000 ->
+            {error, no_req_reply_from_epmd}
+        end;
+    Error ->
+        Error
+    end.
+
 % Internal function to fetch information about a node
 
 port_please_v2(Name) ->
-    case send_req([?EPMD_PORT_PLEASE2_REQ,
+    case send_req([?EPMD_PORT2_REQ,
 		   binary_to_list(unicode:characters_to_binary(Name))]) of
 	{ok,Sock} ->
 	    case recv_until_sock_closes(Sock) of
@@ -327,17 +373,39 @@ stupid_names_req(Config) when is_list(Config) ->
     ?line [FirstConn | Conn] = register_many(1, ?REG_REPEAT_LIM, "foo"),
     ?line unregister_many([FirstConn]),
     sleep(?MEDIUM_PAUSE),
-    ?line ok = check_names(Conn),
+    ?line ok = check_names(Conn, ?EPMD_NAMES2),
     ?line ok = unregister_many(Conn),
     test_server:timetrap_cancel(LongDog),
     ok.
 
-check_names(Conn) ->
+check_names(Conn, ?EPMD_NAMES2 = Opcode) ->
     ?line {ok,Sock} = connect_active(),
-    ?line {ok,Reply} = do_get_names(Sock),
+    ?line {ok,Reply} = do_get_names(Sock, Opcode),
     ?line SortConn  = lists:sort(Conn),
     ?line SortReply = lists:sort(Reply),
     ?line ok = check_names_cmp(SortConn, SortReply),
+    ok;
+check_names(Conn, ?EPMD_NAMES3) ->
+    ?line {ok, Reply} = erl_epmd:names(?PORT),
+    ?line SortConn  = lists:sort(Conn),
+    ?line SortReply = lists:sort(Reply),
+    ?line ok = check_names_cmp(SortConn, SortReply),
+    ok.
+
+
+names3_req(doc) ->
+    ["Read names from epmd using epmd v3 protocol"];
+names3_req(suite) ->
+    [];
+names3_req(Config) when is_list(Config) ->
+    Dog = ?config(watchdog, Config),
+    test_server:timetrap_cancel(Dog),
+    LongDog = test_server:timetrap(?MEDIUM_TEST_TIMEOUT),
+    ?line ok = epmdrun(),
+    ?line Conn = register_many(1, ?REG_REPEAT_LIM, "foo", v3),
+    ?line ok = check_names(Conn, ?EPMD_NAMES3),
+    ?line ok = unregister_many(Conn),
+    test_server:timetrap_cancel(LongDog),
     ok.
     
 
@@ -346,8 +414,9 @@ check_names(Conn) ->
 check_names_cmp([], []) ->
     ok;
 check_names_cmp([{Name,Port,_Sock} | Conn], [{Name,Port} | Reply]) ->
+    check_names_cmp(Conn, Reply);
+check_names_cmp([{Name,Port,_Sock} | Conn], [{Name,[{Port,"inet_tcp"}]} | Reply]) ->
     check_names_cmp(Conn, Reply).
-
 
 % This code is taken directly from "erl_epmd.erl" in R3A01
 
@@ -355,8 +424,22 @@ check_names_cmp([{Name,Port,_Sock} | Conn], [{Name,Port} | Reply]) ->
 -define(u32(X1,X2,X3,X4), 
 	(((X1) bsl 24) bor ((X2) bsl 16) bor ((X3) bsl 8) bor X4)).
 
-do_get_names(Socket) ->
-    inet_tcp:send(Socket, [?int16(1),?EPMD_NAMES_REQ]),
+do_get_names(Socket, ?EPMD_NAMES2) ->
+    ok = gen_tcp:send(Socket, [?int16(1),?EPMD_NAMES2]),
+    receive
+	{tcp, Socket, [P0,P1,P2,P3 | T]} ->
+	    EpmdPort = ?u32(P0,P1,P2,P3),
+	    if EpmdPort == ?PORT ->
+		    names_loop(Socket, T, []);
+	       true ->
+		    close(Socket),
+		    {error, address}
+	    end;
+	{tcp_closed, Socket} ->
+	    {ok, []}
+    end;
+do_get_names(Socket, ?EPMD_NAMES3) ->
+    ok = gen_tcp:send(Socket, [?int16(1),?EPMD_NAMES3]),
     receive
 	{tcp, Socket, [P0,P1,P2,P3 | T]} ->
 	    EpmdPort = ?u32(P0,P1,P2,P3),
@@ -424,14 +507,14 @@ get_port_nr(doc) ->
 get_port_nr(suite) ->
     [];
 get_port_nr(Config) when is_list(Config) ->
-    port_request([?EPMD_PORT_PLEASE2_REQ,"foo"]).
+    port_request([?EPMD_PORT2_REQ,"foo"]).
 
 slow_get_port_nr(doc) ->
     ["Register with slow write and ask about port nr"];
 slow_get_port_nr(suite) ->
     [];
 slow_get_port_nr(Config) when is_list(Config) ->
-    port_request([?EPMD_PORT_PLEASE2_REQ,d,$f,d,$o,d,$o]).
+    port_request([?EPMD_PORT2_REQ,d,$f,d,$o,d,$o]).
 
 
 % Internal function used above
@@ -466,7 +549,7 @@ unregister_others_name_1(Config) when is_list(Config) ->
     ?line ok = epmdrun("-relaxed_command_check"),
     ?line {ok,RSock} = register_node("foo"),
     ?line {ok,Sock} = connect(),
-    M = [?EPMD_STOP_REQ,"foo"],
+    M = [?EPMD_STOP,"foo"],
     ?line ok = send(Sock,[size16(M),M]),
     R = "STOPPED",
     ?line {ok,R} = recv(Sock,length(R)),
@@ -482,7 +565,7 @@ unregister_others_name_2(suite) ->
 unregister_others_name_2(Config) when is_list(Config) ->
     ?line ok = epmdrun("-relaxed_command_check"),
     ?line {ok,Sock} = connect(),
-    M = [?EPMD_STOP_REQ,"xxx42"],
+    M = [?EPMD_STOP,"xxx42"],
     ?line ok = send(Sock,[size16(M),M]),
     R = "NOEXIST",
     ?line {ok,R} = recv(Sock,length(R)),
@@ -549,15 +632,22 @@ rregister_repeat(Count) ->
 
 % Return count of successful registrations
 
-register_many(I, N, _Prefix) when I > N ->
+register_many(I, N, Prefix) ->
+    register_many(I, N, Prefix, v2).
+
+register_many(I, N, _Prefix, _Ver) when I > N ->
     test_server:format("Done with all ~n", []),
     [];
-register_many(I, N, Prefix) ->
+register_many(I, N, Prefix, Ver) ->
     Name = gen_name(Prefix, I),
     Port = ?DUMMY_PORT + I,				% Just make it up
-    case register_node(Name, Port) of
+    Res  = case Ver of
+           v2 -> register_node(Name, Port);
+           v3 -> register_node_v3(Name, Port, <<>>)
+           end,
+    case Res of
 	{ok,Sock} ->
-	    [{Name,Port,Sock} | register_many(I + 1, N, Prefix)];
+	    [{Name,Port,Sock} | register_many(I + 1, N, Prefix, Ver)];
 	Any ->
 	    test_server:format("Can't register: ~w of 1..~w ~w~n", 
 			       [Name,N,Any]),
@@ -874,7 +964,7 @@ do_no_nonlocal_kill(Config,SSHHost) when is_list(Config) ->
     ?line ok = ssh_proxy(SSHHost,ProxyPort),
     Res = try
 	      {ok, E} = connect("localhost",ProxyPort,passive),
-	      M = [?EPMD_KILL_REQ],
+	      M = [?EPMD_KILL],
 	      send(E, [size16(M), M]),
 	      closed = recv(E,2),
 	      gen_tcp:close(E),
@@ -898,19 +988,19 @@ no_live_killing(Config) when is_list(Config) ->
     ?line ok = epmdrun(),
     ?line {ok,RSock} = register_node("foo"),
     ?line {ok,Sock} = connect(),
-    ?line M = [?EPMD_KILL_REQ],
+    ?line M = [?EPMD_KILL],
     ?line ok = send(Sock,[size16(M),M]),
     ?line {ok,"NO"} = recv(Sock,2),
     ?line close(Sock),
     ?line {ok,Sock2} = connect(),
-    ?line M2 = [?EPMD_STOP_REQ,"foo"],
+    ?line M2 = [?EPMD_STOP,"foo"],
     ?line ok = send(Sock2,[size16(M2),M2]),
     ?line closed = recv(Sock2,1),
     ?line close(Sock2),
     ?line close(RSock),
     ?line sleep(?MEDIUM_PAUSE),
     ?line {ok,Sock3} = connect(),
-    ?line M3 = [?EPMD_KILL_REQ],
+    ?line M3 = [?EPMD_KILL],
     ?line ok = send(Sock3,[size16(M3),M3]),
     ?line {ok,"OK"} = recv(Sock3,2),
     ?line close(Sock3),
@@ -924,7 +1014,7 @@ cleanup() ->
     sleep(?MEDIUM_PAUSE),
     case connect() of
 	{ok,Sock} ->
-	    M = [?EPMD_KILL_REQ],
+	    M = [?EPMD_KILL],
 	    send(Sock, [size16(M), M]),
 	    recv(Sock,length("OK")),
 	    close(Sock),
@@ -987,21 +1077,31 @@ osrun(Cmd) ->
 connect() ->
     connect("localhost",?PORT, passive).
 
-connect(Addr) ->
-    connect(Addr,?PORT, passive).
-
 connect_active() ->
-    connect("localhost",?PORT, active).
+    connect_active([]).
+connect_active(Opts) ->
+    connect("localhost", ?PORT, active, Opts).
 
 %% Retry after 15 seconds, to avoid TIME_WAIT socket exhaust.
 connect_sturdy() ->
     connect("localhost",?PORT, passive, 15000, 3).
 
+connect_opt(Opts) ->
+    connect_opt("localhost", Opts).
+connect_opt(Addr, Opts) ->
+    connect(Addr, ?PORT, active, Opts).
+
 % Try a few times before giving up
 connect(Addr, Port, Mode) ->
     connect(Addr, Port, Mode, ?CONN_SLEEP, ?CONN_RETRY).
+connect(Addr, Port, Mode, Opts) ->
+    connect(Addr, Port, Mode, ?CONN_SLEEP, ?CONN_RETRY, Opts).
+
 connect(Addr, Port, Mode, Sleep, Retry) ->
-    case connect_repeat(Addr, Retry, Port, Mode, Sleep) of
+    connect(Addr, Port, Mode, Sleep, Retry, [{packet, 0}]).
+
+connect(Addr, Port, Mode, Sleep, Retry, Opts) ->
+    case connect_repeat(Addr, Retry, Port, Mode, Sleep, Opts) of
 	{ok,Sock} ->
 	    {ok,Sock};
 	{error,timeout} ->
@@ -1018,26 +1118,25 @@ connect(Addr, Port, Mode, Sleep, Retry) ->
 % Try a few times before giving up. Pause a small time between
 % each try.
 
-connect_repeat(Addr, 1, Port, Mode, _Sleep) ->
-    connect_mode(Addr,Port, Mode);
-connect_repeat(Addr,Retry, Port, Mode, Sleep) ->
-    case connect_mode(Addr,Port, Mode) of
+connect_repeat(Addr, 1, Port, Mode, _Sleep, Opts) ->
+    connect_mode(Addr,Port, Mode, Opts);
+connect_repeat(Addr,Retry, Port, Mode, Sleep, Opts) ->
+    case connect_mode(Addr,Port, Mode, Opts) of
 	{ok,Sock} ->
 	    {ok,Sock};
 	{error,Reason} ->
 	    test_server:format("connect: error: ~w~n",[Reason]),
 	    timer:sleep(Sleep),
-	    connect_repeat(Addr, Retry - 1, Port, Mode, Sleep);
+	    connect_repeat(Addr, Retry - 1, Port, Mode, Sleep, Opts);
 	Any ->
 	    test_server:format("connect: unknown message: ~w~n",[Any]),
 	    exit(1)
     end.
 
-connect_mode(Addr,Port, active) ->
-    gen_tcp:connect(Addr, Port, [{packet, 0}], ?CONN_TIMEOUT);
-connect_mode(Addr, Port, passive) ->
-    gen_tcp:connect(Addr, Port, [{packet, 0}, {active, false}],
-		    ?CONN_TIMEOUT).
+connect_mode(Addr,Port, active, Opts) ->
+    gen_tcp:connect(Addr, Port, Opts, ?CONN_TIMEOUT);
+connect_mode(Addr, Port, passive, Opts) ->
+    gen_tcp:connect(Addr, Port, [{active, false} | Opts], ?CONN_TIMEOUT).
 
 
 close(Sock) ->

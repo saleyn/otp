@@ -158,33 +158,52 @@ void epmd_call(EpmdVars *g,int what)
 void epmd_call3(EpmdVars *g, int what, int fd, char* buf, int size)
 {
     char *pbuf = buf, *p = buf;
-    int ret = 0,i,sz;
+    int ret = 0, i, sz, block_num = 0, more_data = 1;
 
-    if (read(fd,(char *)&i,2) != 2)
-        goto cleanup;
-    sz = htons(i);
-    if (sz > sizeof(buf))
-        p = pbuf = malloc(sz);
+    for (; more_data; block_num++) {
+        if (read(fd,(char *)&i,2) != 2) {
+            ret = 1;
+            if (!g->silent)
+                printf("epmd: no response from local epmd\n");
+            break;
+        }
 
-    if (read(fd,pbuf,sz) != sz)
-        goto error_cleanup;
+        sz = htons(i);
+        if (sz > size) {
+            if (pbuf != buf)
+                free(pbuf);
+            p = pbuf = malloc(sz);
+        }
 
-    i = ntohl(*((int*)p)); p += 4;
+        if (read(fd,p,sz) != sz) {
+            ret = 1;
+            if (!g->silent)
+                printf("epmd: no response from local epmd\n");
+            break;
+        }
 
-    if (!g->silent) {
-	i = erts_snprintf(buf, OUTBUF_SIZE,
-	        "epmd: up and running on port %d with data:\n", i);
-	write(1, buf, i);
+        more_data = *p++;
+        sz--;
 
-        write(1, p, sz); /* Potentially UTF-8 encoded */
+        if (!block_num) {
+            /* Read EPMD port number */
+            i = ntohl(*((int*)p));
+            p  += 4;
+            sz -= 4;
+        }
+
+        if (!g->silent) {
+            if (!block_num) {
+                char bf[80];
+                i = erts_snprintf(bf, sizeof(bf),
+                        "epmd: up and running on port %d with data:\n", i);
+                write(1, bf, i);
+            }
+
+            write(1, p, sz); /* Potentially UTF-8 encoded */
+        }
     }
-    goto cleanup;
 
-error_cleanup:
-    ret = 1;
-    if (!g->silent)
-        printf("epmd: no response from local epmd\n");
-cleanup:
     close(fd);
     if (pbuf != buf)
         free(pbuf);
